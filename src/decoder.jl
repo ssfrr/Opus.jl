@@ -1,3 +1,107 @@
+using SampledSignals
+
+# TODO: use do notation rather than finalizing
+mutable struct OpusStreamDecoder{T} <: SampleSource
+    v::Ptr{Cvoid}
+    packetsource::T
+    header::OpusHead
+    tags::OpusTags
+    readbuf::Array{Float32,2}
+    samplebuf::Array{Float32,2}
+    sampleoffset::Int
+end
+
+function readpacket(packetsource)
+    next = iterate(packetsource)
+    next === nothing && throw(ErrorException("No packets left in iterator"))
+
+    next[1]
+end
+
+"""
+`packetsource` should be an iterator that supplies packets as `Vector{UInt8}`
+"""
+function OpusStreamDecoder(packetsource::T) where {T}
+    header = OpusHead(readpacket(packetsource))
+    tags = OpusTags(readpacket(packetsource))
+
+    channelmap = [Cchar(i) for i in 0:(header.channels-1)]
+    errorptr = Ref{Cint}(0);
+    # Create new decoder object with the given samplerate and channel
+    decptr = ccall((:opus_multistream_decoder_create, libopus), Ptr{Cvoid},
+                   (Cint, Cint, Cint, Cint, Ref{Cchar}, Ref{Cint}),
+                   header.samplerate, header.channels, header.channels, 0,
+                   channelmap, errorptr)
+    err = errorptr[]
+    if err != OPUS_OK
+        error("opus_multistream_decoder_create() failed: $(OPUS_ERROR_MESSAGE_STRS[err])")
+    end
+
+    dec = OpusStreamDecoder{T}(decptr, packetsource, header, tags,
+                               Array{Float32, 2}(undef, header.channels, 0),
+                               Array{Float32, 2}(undef, 0, header.channels),
+                               0)
+
+    # Register finalizer to cleanup this decoder
+    finalizer(dec) do x
+        ccall((:opus_multistream_decoder_destroy,libopus),Cvoid,(Ptr{Cvoid},),x.v)
+    end
+
+    dec
+end
+
+SampledSignals.samplerate(dec::OpusStreamDecoder) = Int(dec.header.samplerate)
+SampledSignals.nchannels(dec::OpusStreamDecoder) = Int(dec.header.channels)
+Base.eltype(dec::OpusStreamDecoder) = Float32
+
+# copy from our internal buffer
+function _read!(dec::OpusStreamDecoder, buf)
+    n = min(size(dec.samplebuf, 1) - dec.sampleoffset, size(buf, 1))
+    buf[1:n, :] .= dec.samplebuf[(1:n) .+ dec.sampleoffset, :]
+    dec.sampleoffset += n
+
+    n
+end
+
+function reloadbuf(dec::OpusStreamDecoder)
+    packet = readpacket(dec.packetsource)
+    packet_samples = get_nb_samples(packet, samplerate(dec))
+    # resize our buffer if necessary
+    if size(dec.samplebuf, 1) != packet_samples
+        dec.readbuf = zeros(Float32, nchannels(dec), packet_samples)
+        dec.samplebuf = zeros(Float32, packet_samples, nchannels(dec))
+    end
+
+    num_samples = ccall((:opus_multistream_decode_float, libopus), Cint,
+                        (Ptr{Cvoid}, Ref{UInt8}, Int32, Ref{Float32}, Cint, Cint),
+                        dec.v, packet, length(packet),
+                        dec.readbuf, packet_samples*nchannels(dec), 0)
+    if num_samples < 0
+        error("opus_decode_float() failed: $(OPUS_ERROR_MESSAGE_STRS[num_samples])")
+    end
+    # transpose to de-interleave
+    permutedims!(dec.samplebuf, dec.readbuf, (2,1))
+    dec.sampleoffset = 0
+
+    nothing
+end
+
+
+# TODO: handle EOF
+function Base.read!(dec::OpusStreamDecoder, buf::AbstractMatrix)
+    # first copy what we have buffered
+    nread = _read!(dec, buf)
+
+    while nread < size(buf, 1)
+        # we weren't able to complete the read with what we had buffered
+        reloadbuf(dec)
+        nread2 = _read!(dec, view(buf, (nread+1):size(buf, 1), :))
+        nread += nread2
+    end
+
+    nread
+end
+
 """
 Opaque Decoder struct
 """
@@ -28,7 +132,9 @@ mutable struct OpusDecoder  # mutable so that finalizer can be applied
 end
 
 function get_nb_samples(data, fs)
-    num_samples = ccall((:opus_packet_get_nb_samples, libopus), Cint, (Ptr{UInt8}, Int32, Int32), data, length(data), fs)
+    num_samples = ccall((:opus_packet_get_nb_samples, libopus), Cint,
+                        (Ptr{UInt8}, Int32, Int32),
+                        data, length(data), fs)
     if num_samples < 0
         error("opus_packet_get_nb_samples() failed: $(OPUS_ERROR_MESSAGE_STRS[num_samples])")
     end
@@ -93,7 +199,7 @@ function load(fio::IO)
             opus_head = OpusHead(packets[serial][1])
             opus_tags = OpusTags(packets[serial][2])
         # TODO: throw a more specific exception. Catching all exceptions here
-        # makes things hard to debug if there's a problem (or Julia syntax changes) 
+        # makes things hard to debug if there's a problem (or Julia syntax changes)
         catch
             continue
         end
