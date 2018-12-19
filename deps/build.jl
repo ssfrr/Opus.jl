@@ -1,5 +1,6 @@
 using BinDeps
 using Compat
+using Base.Sys: isapple
 
 if isdefined((@static VERSION < v"0.7.0-DEV.484" ? current_module() : @__MODULE__), :Compat)
     import Compat.Libdl
@@ -11,7 +12,7 @@ end
 
 libopus = library_dependency("libopus", aliases = ["libopus"])
 
-@static if is_apple()
+@static if isapple()
   using Homebrew
   provides( Homebrew.HB, "opus", libopus, os = :Darwin )
 end
