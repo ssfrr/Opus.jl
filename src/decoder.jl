@@ -1,135 +1,102 @@
 using SampledSignals
 
-# TODO: use do notation rather than finalizing
-mutable struct OpusStreamDecoder{T} <: SampleSource
-    v::Ptr{Cvoid}
+mutable struct OpusIter{T, S, N}
     packetsource::T
+    iterstate::S
+    decoder::Ptr{Cvoid}
     header::OpusHead
     tags::OpusTags
-    readbuf::Array{Float32,2}
-    samplebuf::Array{Float32,2}
-    sampleoffset::Int
+    buf::Vector{Float32}
+    bufoffset::Int
 end
 
-function readpacket(packetsource)
-    next = iterate(packetsource)
-    next === nothing && throw(ErrorException("No packets left in iterator"))
+const allowed_samplerates = (8000, 12000, 16000, 24000, 48000)
 
-    next[1]
-end
+function OpusIter(packetsource, samplerate=48000)
+    if samplerate ∉ allowed_samplerates
+        throw(ArgumentError("Samplerate must be $(join(allowed_samplerates, ", ", ", or ")). Got $samplerate"))
+    end
+    iter = iterate(packetsource)
+    iter === nothing && throw(ErrorException("Reached end of packet stream without a header packet"))
+    packet, iterstate = iter
+    header = OpusHead(packet)
+    iter = iterate(packetsource, iterstate)
+    packet === nothing && throw(ErrorException("Reached end of packet stream without a tags packet"))
+    packet, iterstate = iter
+    tags = OpusTags(packet)
 
-"""
-`packetsource` should be an iterator that supplies packets as `Vector{UInt8}`
-"""
-function OpusStreamDecoder(packetsource::T) where {T}
-    header = OpusHead(readpacket(packetsource))
-    tags = OpusTags(readpacket(packetsource))
-
-    channelmap = [Cchar(i) for i in 0:(header.channels-1)]
     errorptr = Ref{Cint}(0);
-    # Create new decoder object with the given samplerate and channel
-    decptr = ccall((:opus_multistream_decoder_create, libopus), Ptr{Cvoid},
-                   (Cint, Cint, Cint, Cint, Ref{Cchar}, Ref{Cint}),
-                   header.samplerate, header.channels, header.channels, 0,
-                   channelmap, errorptr)
+
+    # Create new decoder object with the given samplerate and channel info
+    decoder = ccall((:opus_multistream_decoder_create, libopus), Ptr{Cvoid},
+                    (Int32, Cint, Cint, Cint, Ref{UInt8}, Ref{Cint}),
+                    samplerate, header.channels, header.stream_count,
+                    header.coupled_count, header.channel_map_table, errorptr)
     err = errorptr[]
     if err != OPUS_OK
         error("opus_multistream_decoder_create() failed: $(OPUS_ERROR_MESSAGE_STRS[err])")
     end
 
-    dec = OpusStreamDecoder{T}(decptr, packetsource, header, tags,
-                               Array{Float32, 2}(undef, header.channels, 0),
-                               Array{Float32, 2}(undef, 0, header.channels),
-                               0)
-
-    # Register finalizer to cleanup this decoder
-    finalizer(dec) do x
-        ccall((:opus_multistream_decoder_destroy,libopus),Cvoid,(Ptr{Cvoid},),x.v)
-    end
-
-    dec
+    OpusIter{typeof(packetsource), typeof(iterstate), Int(header.channels)}(
+            packetsource, iterstate, decoder, header, tags, Float32[], 0)
 end
 
-SampledSignals.samplerate(dec::OpusStreamDecoder) = Int(dec.header.samplerate)
-SampledSignals.nchannels(dec::OpusStreamDecoder) = Int(dec.header.channels)
-Base.eltype(dec::OpusStreamDecoder) = Float32
-
-# copy from our internal buffer
-function _read!(dec::OpusStreamDecoder, buf)
-    n = min(size(dec.samplebuf, 1) - dec.sampleoffset, size(buf, 1))
-    buf[1:n, :] .= dec.samplebuf[(1:n) .+ dec.sampleoffset, :]
-    dec.sampleoffset += n
-
-    n
+function Base.close(dec::OpusIter)
+    if dec.decoder != C_NULL
+        ccall((:opus_multistream_decoder_destroy,libopus), Cvoid, (Ptr{Cvoid},), dec.decoder)
+        dec.decoder = C_NULL
+    else
+        @warn "Opus decoder closed more than once"
+    end
 end
 
-function reloadbuf(dec::OpusStreamDecoder)
-    packet = readpacket(dec.packetsource)
-    packet_samples = get_nb_samples(packet, samplerate(dec))
-    # resize our buffer if necessary
-    if size(dec.samplebuf, 1) != packet_samples
-        dec.readbuf = zeros(Float32, nchannels(dec), packet_samples)
-        dec.samplebuf = zeros(Float32, packet_samples, nchannels(dec))
+@inline function OpusIter(fn::Function, args...)
+    opus = OpusIter(args...)
+    try
+        fn(opus)
+    finally
+        close(opus)
     end
-
-    num_samples = ccall((:opus_multistream_decode_float, libopus), Cint,
-                        (Ptr{Cvoid}, Ref{UInt8}, Int32, Ref{Float32}, Cint, Cint),
-                        dec.v, packet, length(packet),
-                        dec.readbuf, packet_samples*nchannels(dec), 0)
-    if num_samples < 0
-        error("opus_decode_float() failed: $(OPUS_ERROR_MESSAGE_STRS[num_samples])")
-    end
-    # transpose to de-interleave
-    permutedims!(dec.samplebuf, dec.readbuf, (2,1))
-    dec.sampleoffset = 0
-
-    nothing
 end
 
-
-# TODO: handle EOF
-function Base.read!(dec::OpusStreamDecoder, buf::AbstractMatrix)
-    # first copy what we have buffered
-    nread = _read!(dec, buf)
-
-    while nread < size(buf, 1)
-        # we weren't able to complete the read with what we had buffered
-        reloadbuf(dec)
-        nread2 = _read!(dec, view(buf, (nread+1):size(buf, 1), :))
-        nread += nread2
-    end
-
-    nread
-end
-
-"""
-Opaque Decoder struct
-"""
-mutable struct OpusDecoder  # mutable so that finalizer can be applied
-    v::Ptr{Cvoid}
-    fs::Int32
-    channels::Cint
-
-    """
-    Create new OpusDecoder object with given samplerate and channels
-    """
-    function OpusDecoder(samplerate, channels)
-        errorptr = Ref{Cint}(0);
-        # Create new decoder object with the given samplerate and channel
-        decptr = ccall((:opus_decoder_create,libopus), Ptr{Cvoid}, (Int32, Cint, Ref{Cint}), samplerate, channels, errorptr)
-        err = errorptr[]
-        dec = new(decptr, samplerate, channels)
-        if err != OPUS_OK
-            error("opus_decoder_create() failed: $(OPUS_ERROR_MESSAGE_STRS[err])")
+function Base.iterate(opus::OpusIter, state=nothing)
+    @assert opus.bufoffset <= length(opus.buf)
+    if opus.bufoffset == length(opus.buf)
+        # we've read everything from the buffer, reload it from the packet
+        # iterator
+        iter = iterate(opus.packetsource, opus.iterstate)
+        iter === nothing && return nothing
+        packet, opus.iterstate = iter
+        packet_frames = get_nb_samples(packet, samplerate(opus))
+        packet_samples = packet_frames * nchannels(opus)
+        # resize our buffer if necessary
+        if length(opus.buf) != packet_samples
+            resize!(opus.buf, packet_samples)
+        end
+        # TODO: figure out whether we need to be handling the `decode_fec` argument
+        num_samples = ccall((:opus_multistream_decode_float, libopus), Cint,
+                            (Ptr{Cvoid}, Ref{UInt8}, Int32, Ref{Float32}, Cint, Cint),
+                            opus.decoder, packet, length(packet),
+                            opus.buf, packet_frames, 0)
+        if num_samples < 0
+            error("opus_decode_float() failed: $(OPUS_ERROR_MESSAGE_STRS[num_samples])")
         end
 
-        # Register finalizer to cleanup this decoder
-        finalizer(dec) do x
-            ccall((:opus_decoder_destroy,libopus),Cvoid,(Ptr{Cvoid},),x.v)
-        end
-        return dec
+        opus.bufoffset = 0
     end
+
+    # TODO is it faster to reinterpret rather than copying into the tuple?
+    outframe = ntuple(i->opus.buf[opus.bufoffset+i], nchannels(opus))
+    opus.bufoffset += nchannels(opus)
+
+    (outframe, nothing)
 end
+
+SampledSignals.samplerate(dec::OpusIter) = Int(dec.header.samplerate)
+SampledSignals.nchannels(dec::OpusIter{T, S, N}) where {T, S, N} = N
+Base.IteratorSize(::Type{<:OpusIter}) = Base.SizeUnknown()
+Base.IteratorEltype(::Type{<:OpusIter}) = Base.HasEltype()
+Base.eltype(::Type{OpusIter{T, S, N}}) where {T, S, N} = NTuple{N, Float32}
 
 function get_nb_samples(data, fs)
     num_samples = ccall((:opus_packet_get_nb_samples, libopus), Cint,
@@ -141,81 +108,37 @@ function get_nb_samples(data, fs)
     return num_samples
 end
 
-function decode_packet(dec::OpusDecoder, packet::Vector{UInt8})
-    packet_samples = get_nb_samples(packet, dec.fs)
-    output = Vector{Float32}(undef, packet_samples*dec.channels)
-
-    #print("opus_decode_float: ")
-    num_samples = ccall((:opus_decode_float,libopus), Cint, (Ptr{Cvoid}, Ptr{UInt8}, Int32, Ptr{Float32}, Cint, Cint),
-                        dec.v, packet, length(packet), output, packet_samples*dec.channels, 0)
-    if num_samples < 0
-        error("opus_decode_float() failed: $(OPUS_ERROR_MESSAGE_STRS[num_samples])")
-    end
-    return output
-end
-
-"""
-Packets go in, floating-point audio stream comes out
-"""
-function decode_all_packets(dec::OpusDecoder, packets::Vector{Vector{UInt8}})
-    # Skip past header packets
-    start_idx = 1
-    while is_header_packet(packets[start_idx])
-        start_idx += 1
-    end
-
-    # Figure out the length of each packet
-    packet_lens = map(packet -> get_nb_samples(packet, dec.fs)*dec.channels, packets[start_idx:end])
-    packet_lens = vcat(zeros(Int32, start_idx - 1), packet_lens)
-
-    # Allocate output now that we know the length of all our audio
-    output = Vector{Float32}(undef, sum(packet_lens))
-
-    # Decode each packet into its corresponding chunk of output
-    out_idx = 1
-    for idx in start_idx:length(packets)
-        output[out_idx:out_idx + packet_lens[idx] - 1] = decode_packet(dec, packets[idx])
-        out_idx += packet_lens[idx]
-    end
-
-    # Return our hard-earned goodness, reshaping if we're stereo!
-    if dec.channels > 1
-        return reshape(output, (Int64(dec.channels), div(length(output), dec.channels)))'
-    end
-    return output''
-end
-
-"""
-Returns (audio, fs) unless the ogg file has no opus streams
-"""
-function load(fio::IO)
-    audio = nothing
-    packets = Ogg.load(fio)
-    for serial in keys(packets)
-        opus_head = OpusHead()
-        opus_tags = OpusTags()
-        try
-            # Find the first stream that is Opus and decode it
-            opus_head = OpusHead(packets[serial][1])
-            opus_tags = OpusTags(packets[serial][2])
-        # TODO: throw a more specific exception. Catching all exceptions here
-        # makes things hard to debug if there's a problem (or Julia syntax changes)
-        catch
-            continue
-        end
-        dec = Opus.OpusDecoder(48000, opus_head.channels)
-        audio = decode_all_packets(dec, packets[serial])
-        break
-    end
-
-    if audio == nothing
-        error("Could not find any Opus streams!")
-    end
-    return audio, 48000
-end
-
-function load(file_path::Union{File{format"OPUS"},AbstractString})
-    open(file_path) do fio
-        return load(fio)
-    end
-end
+# """
+# Returns (audio, fs) unless the ogg file has no opus streams
+# """
+# function load(fio::IO)
+#     audio = nothing
+#     packets = Ogg.load(fio)
+#     for serial in keys(packets)
+#         opus_head = OpusHead()
+#         opus_tags = OpusTags()
+#         try
+#             # Find the first stream that is Opus and decode it
+#             opus_head = OpusHead(packets[serial][1])
+#             opus_tags = OpusTags(packets[serial][2])
+#         # TODO: throw a more specific exception. Catching all exceptions here
+#         # makes things hard to debug if there's a problem (or Julia syntax changes)
+#         catch
+#             continue
+#         end
+#         dec = Opus.OpusDecoder(48000, opus_head.channels)
+#         audio = decode_all_packets(dec, packets[serial])
+#         break
+#     end
+#
+#     if audio == nothing
+#         error("Could not find any Opus streams!")
+#     end
+#     return audio, 48000
+# end
+#
+# function load(file_path::Union{File{format"OPUS"},AbstractString})
+#     open(file_path) do fio
+#         return load(fio)
+#     end
+# end

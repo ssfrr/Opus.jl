@@ -24,8 +24,6 @@ const OPUS_APPLICATION_AUDIO               = 2049
 const OPUS_APPLICATION_RESTRICTED_LOWDELAY = 2051
 
 struct OpusHead
-    # Magic bytes "OpusHead" (0x646165487375704f)
-    opus_head::UInt64
     # Should always be equal to one
     version::UInt8
     # Number of channels, must be greater than zero
@@ -36,39 +34,73 @@ struct OpusHead
     # NOTE: This is currently completely ignored in Opus.jl
     preskip::UInt16
     # Samplerate of input stream (Let's face it, it's always 48 KHz)
-    samplerate::UInt32
+    samplerate::Int32
     # Output gain that should be applied
     output_gain::UInt16
-    # Channel mapping family, we always assume this is zero
+    # Channel mapping family
     channel_map_family::UInt8
+    # number of total input streams in a multistream opus stream
+    stream_count::UInt8
+    # number of streams that should be decoded as stereo
+    coupled_count::UInt8
+    # this table specifies for each output channel, which input channel should
+    # be mapped into it. For instance a table of [0, 1, 2, 2] would decode 3
+    # encoded channels into 4 output channels, with the third channel repeated
+    # into the third and fourth output channels
+    channel_map_table::Vector{UInt8}
 end
 
-OpusHead() = OpusHead(0x646165487375704f, 1, 1, 312, 48000, 0, 0)
-OpusHead(samplerate, channels) = OpusHead(0x646165487375704f, 1, channels, 312, samplerate, 0, 0)
+OpusHead() = OpusHead(1, 1, 312, 48000, 0, 0, 0, 0, UInt8[])
+OpusHead(samplerate, channels) = OpusHead(1, channels, 312, samplerate, 0, 0, 0, 0, UInt8[])
+
+# this header is technically part of the Ogg-Opus spec:
+# https://tools.ietf.org/html/draft-ietf-codec-oggopus-14
+# it defines the necessary header for an Opus stream embedded within an Ogg
+# container stream
 
 function OpusHead(io::IO)
-    magic = read(io, UInt64)
-    if magic != 0x646165487375704f
-        error("Input packet is not an OpusHead!, magic is $(magic)")
+    magic = read(io, 8)
+    if magic != b"OpusHead"
+        error("Input packet is not an \"OpusHead\"!, magic is $(magic)")
     end
     version = read(io, UInt8)
     channels = read(io, UInt8)
-    preskip = read(io, UInt16)
-    samplerate = read(io, UInt32)
-    output_gain = read(io, UInt16)
+    preskip = ltoh(read(io, UInt16))
+    samplerate = ltoh(read(io, UInt32))
+    output_gain = ltoh(read(io, UInt16))
     channel_map_family = read(io, UInt8)
-    return OpusHead( magic, version, channels, preskip, samplerate, output_gain, channel_map_family)
+    if channel_map_family == 0
+        stream_count = 1
+        coupled_count = channels-1
+        channel_map_table = UInt8[]
+    else
+        stream_count = read(io, UInt8)
+        coupled_count = read(io, UInt8)
+        channel_map_table = read(io, channels)
+    end
+    return OpusHead(version, channels, preskip, samplerate, output_gain,
+                    channel_map_family, stream_count, coupled_count,
+                    channel_map_table)
 end
 OpusHead(data::Vector{UInt8}) = OpusHead(IOBuffer(data))
 
 function write(io::IO, x::OpusHead)
-    write(io, x.opus_head)
-    write(io, x.version)
-    write(io, x.channels)
-    write(io, x.preskip)
-    write(io, x.samplerate)
-    write(io, x.output_gain)
-    write(io, x.channel_map_family)
+    for val in (b"OpusHead",
+                x.version,
+                x.channels,
+                x.preskip,
+                x.samplerate,
+                x.output_gain,
+                x.channel_map_family)
+        write(io, val)
+    end
+    if x.channel_map_family != 0
+        for val in (x.stream_count,
+                    x.coupled_count,
+                    x.channel_map_table)
+            write(io, val)
+        end
+    end
 end
 
 function convert(::Type{Vector{UInt8}}, x::OpusHead)
@@ -84,13 +116,10 @@ end
 
 
 mutable struct OpusTags
-    # Magic signature "OpusTags" (0x736761547375704f)
-    opus_tags::UInt64
-
     vendor_string::AbstractString
     tags::Vector{AbstractString}
 end
-OpusTags() = OpusTags(0x736761547375704f, "Opus.jl", AbstractString["encoder=Opus.jl"])
+OpusTags() = OpusTags("Opus.jl", AbstractString["encoder=Opus.jl"])
 
 function read_opus_tag(io::IO)
     # First, read in a length
@@ -109,8 +138,8 @@ function write_opus_tag(io::IO, tag::AbstractString)
 end
 
 function OpusTags(io::IO)
-    magic = read(io, UInt64)
-    if magic != 0x736761547375704f
+    magic = read(io, 8)
+    if magic != b"OpusTags"
         error("Input packet is not an OpusTags!, magic is $(magic)")
     end
     # First, read the vendor string
@@ -122,12 +151,12 @@ function OpusTags(io::IO)
     # Read all the tags in, one after another
     tags = [read_opus_tag(io) for idx in 1:num_tags]
 
-    return OpusTags(magic, vendor_string, tags)
+    return OpusTags(vendor_string, tags)
 end
 OpusTags(data::Vector{UInt8}) = OpusTags(IOBuffer(data))
 
 function write(io::IO, x::OpusTags)
-    write(io, x.opus_tags)
+    write(io, b"OpusTags")
     write_opus_tag(io, x.vendor_string)
 
     write(io, UInt32(length(x.tags)))
@@ -157,8 +186,8 @@ end
 function is_header_packet(packet::Vector{UInt8})
     # Check if it's an OpusHead or OpusTags packet
     if length(packet) > 8
-        magic = String(packet[1:8])
-        if magic == "OpusHead" || magic == "OpusTags"
+        magic = packet[1:8]
+        if magic == b"OpusHead" || magic == b"OpusTags"
             return true
         end
     end
