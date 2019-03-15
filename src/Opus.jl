@@ -4,7 +4,7 @@ using Compat
 using FileIO
 import Base: convert, show, write
 
-export OpusIter
+export OpusIter, preskip
 export OpusDecoder, OpusEncoder, OpusArray, load, save
 
 const depfile = joinpath(dirname(@__FILE__), "..", "deps", "deps.jl")

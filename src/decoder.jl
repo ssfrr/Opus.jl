@@ -85,8 +85,11 @@ function Base.iterate(opus::OpusIter, state=nothing)
         opus.bufoffset = 0
     end
 
-    # TODO is it faster to reinterpret rather than copying into the tuple?
-    outframe = ntuple(i->opus.buf[opus.bufoffset+i], nchannels(opus))
+    # the following 2 approaches are equivalent but unsafe_load is about 3x faster
+    # outframe = ntuple(i->opus.buf[opus.bufoffset+i], nchannels(opus))
+    outframe = unsafe_load(
+        Ptr{NTuple{nchannels(opus), Float32}}(pointer(opus.buf,
+                                                      opus.bufoffset+1)))
     opus.bufoffset += nchannels(opus)
 
     (outframe, nothing)
@@ -97,6 +100,7 @@ SampledSignals.nchannels(dec::OpusIter{T, S, N}) where {T, S, N} = N
 Base.IteratorSize(::Type{<:OpusIter}) = Base.SizeUnknown()
 Base.IteratorEltype(::Type{<:OpusIter}) = Base.HasEltype()
 Base.eltype(::Type{OpusIter{T, S, N}}) where {T, S, N} = NTuple{N, Float32}
+preskip(dec::OpusIter) = Int(dec.header.preskip)
 
 function get_nb_samples(data, fs)
     num_samples = ccall((:opus_packet_get_nb_samples, libopus), Cint,
